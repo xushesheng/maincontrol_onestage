@@ -85,20 +85,20 @@ typedef struct {
 
 #pragma pack(push, 1)
 typedef struct {
-    uint8_t  magic[4];
-    uint8_t  version;
-    uint8_t  flags;
-    uint16_t count_be;
-    uint32_t seq_be;
+    uint8_t  magic[4];      //AMPB
+    uint8_t  version;		//1
+    uint8_t  flags;			//0
+    uint16_t count_be;		//子包数量
+    uint32_t seq_be;		//序号
 } amp_batch_hdr_t;
 #pragma pack(pop)
 
 typedef struct {
-    uint8_t  buf[AMP_BATCH_MAX_BYTES];
-    size_t   len;
-    uint16_t count;
-    uint32_t seq;
-    uint32_t dst_ip; /* network byte order */
+    uint8_t  buf[AMP_BATCH_MAX_BYTES];		//640字节缓冲区
+    size_t   len;							//当前已写入长度
+    uint16_t count;							//当前已写入子包数量
+    uint32_t seq;							//批帧序号
+    uint32_t dst_ip; 						//当前批次的目的IP地址
 } batch_state_t;
 
 static int amp_fd = -1;
@@ -177,6 +177,11 @@ static void run_cmd(const char *cmd)
         fprintf(stderr, "[WARN] cmd failed (%d): %s\n", rc, cmd);
 }
 
+/*
+ * 根据本板卡eth1 IP（192.168.1.13 / 192.168.1.12）推导：
+ * - 要代理ARP的“远端PC IP”
+ * - rf0地址
+ */
 static void setup_gateway_rules(void)
 {
     struct in_addr local_ip;
@@ -186,15 +191,18 @@ static void setup_gateway_rules(void)
     }
 
     uint8_t *p = (uint8_t *)&local_ip.s_addr; /* network order */
+    /* local_ip.s_addr是网络序，逐字节拿出来没问题 */
     uint8_t last = p[3];
 
     const char *remote_pc = NULL;
     const char *rf_ip = NULL;
 
     if (last == 13) {
+        /* 板卡A：192.168.1.13 连接 PC A(192.168.1.20)，要把发往PC B(192.168.1.15)的流量引到自己 */
         remote_pc = "192.168.1.15"; /* PC B */
         rf_ip = "10.255.0.1/30";
     } else if (last == 12) {
+        /* 板卡B：192.168.1.12 连接 PC B(192.168.1.15)，要把发往PC A(192.168.1.20)的流量引到自己 */
         remote_pc = "192.168.1.20"; /* PC A */
         rf_ip = "10.255.0.2/30";
     } else {
@@ -210,10 +218,13 @@ static void setup_gateway_rules(void)
         exit(1);
     }
 
+    /* 让内核允许转发 */
     run_cmd("sysctl -w net.ipv4.ip_forward=1 >/dev/null");
+    /* 避免反向路径过滤把转发包丢掉 */
     run_cmd("sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null");
     run_cmd("sysctl -w net.ipv4.conf.eth1.rp_filter=0 >/dev/null");
 
+    /* proxy ARP：让PC把对端PC的ARP解析到本板卡MAC */
     run_cmd("sysctl -w net.ipv4.conf.eth1.proxy_arp=1 >/dev/null");
     {
         char cmd[256];
@@ -221,6 +232,7 @@ static void setup_gateway_rules(void)
         run_cmd(cmd);
     }
 
+    /* TUN口配置 */
     run_cmd("ip link set rf0 up 2>/dev/null || true");
     {
         char cmd[256];
@@ -233,6 +245,7 @@ static void setup_gateway_rules(void)
         run_cmd(cmd);
     }
     {
+        /* 把远端PC的/32路由导向rf0，使内核把这类包吐给TUN */
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "ip route add %s/32 dev rf0 2>/dev/null || true", remote_pc);
         run_cmd(cmd);
@@ -242,6 +255,9 @@ static void setup_gateway_rules(void)
            CAP_IFACE, inet_ntoa(local_ip), remote_pc, remote_pc);
 }
 
+/******
+*初始化聚合帧
+******/
 static void batch_reset(batch_state_t *b)
 {
     uint32_t seq = b->seq;
@@ -304,6 +320,9 @@ static int amp_send_msg(uint32_t dst_ip, const uint8_t *payload, size_t len)
     return 0;
 }
 
+/*
+ *发送当前批次的所有数据
+ */
 static int amp_flush_batch_if_any(batch_state_t *b)
 {
     if (b->count == 0)
@@ -348,28 +367,29 @@ static int is_icmp_ping_fastpath(const uint8_t *pkt, size_t len)
     return 0;
 }
 
+/* 线程1：从TUN读取需要“跨射频”的IP包，写入驱动（-> CPU1 -> 对端） */
 static void *tun_to_amp_thread(void *arg)
 {
     (void)arg;
     uint8_t buf[MAX_PAYLOAD_SIZE];
 
-    batch_state_t batch;
-    memset(&batch, 0, sizeof(batch));
-    batch_reset(&batch);
+    batch_state_t batch;																	//准备一个空帧
+    memset(&batch, 0, sizeof(batch));                                                       //清零帧数据
+    batch_reset(&batch);																	//初始化批次帧
 
     (void)set_nonblock(tun_fd);
 
     while (1) {
-        int timeout_ms = (batch.count == 0) ? -1 : AMP_BATCH_TIMEOUT_MS;
-        struct pollfd pfd = { .fd = tun_fd, .events = POLLIN };
-        int prc = poll(&pfd, 1, timeout_ms);
-        if (prc < 0) {
+        int timeout_ms = (batch.count == 0) ? -1 : AMP_BATCH_TIMEOUT_MS;                    //batch 为空：timeout=-1;batch 非空：timeout=AMP_BATCH_TIMEOUT_MS
+        struct pollfd pfd = { .fd = tun_fd, .events = POLLIN };                             //初始化poll阻塞，设置标识符为tun_fd,events为pollin可读
+        int prc = poll(&pfd, 1, timeout_ms);                                                //阻塞pfd标识timeout_ms时间
+        if (prc < 0) {                                                                      //>0表示pfd中准备好
             if (errno == EINTR) continue;
             perror("poll(tun)");
             break;
         }
 
-        if (prc == 0) {
+        if (prc == 0) {                                                                     //表示pfd中tun_fd没有准备好读写或出错，当poll阻塞超时timeout
             /* 聚合窗口超时：发掉当前批次 */
             (void)amp_flush_batch_if_any(&batch);
             continue;
@@ -377,8 +397,8 @@ static void *tun_to_amp_thread(void *arg)
 
         /* 尽可能把当前可读的数据读空（non-blocking），提高聚合命中率 */
         while (1) {
-            ssize_t n = read(tun_fd, buf, sizeof(buf));
-            if (n < 0) {
+            ssize_t n = read(tun_fd, buf, sizeof(buf));                                     //从tun中取一个IP包
+            if (n < 0) {                                                                    //报错
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     break;
                 if (errno == EINTR)
@@ -386,68 +406,69 @@ static void *tun_to_amp_thread(void *arg)
                 perror("read(tun)");
                 goto out;
             }
-            if (n == 0)
+            if (n == 0)//无数据
                 break;
 
-            if ((size_t)n < sizeof(struct iphdr))
+            if ((size_t)n < sizeof(struct iphdr))                                           //如果小于iphdr结构体长度
                 continue;
             struct iphdr *ip = (struct iphdr *)buf;
             if (ip->version != 4)
                 continue;
-            if (ip->daddr != remote_pc_addr)
+            if (ip->daddr != remote_pc_addr)                                                //确定目的IP为对端节点IP
                 continue;
 
-            size_t pkt_len = (size_t)n;
-            uint32_t dst_ip = ip->daddr;
+            size_t pkt_len = (size_t)n;                                                     //定义pkt_len设置为本条IP包长度
+            uint32_t dst_ip = ip->daddr;                                                    //定义dst_ip赋值为当前IP包目的地址
 
 #if AMP_ICMP_FASTPATH
-            int is_ping = is_icmp_ping_fastpath(buf, pkt_len);
+            int is_ping = is_icmp_ping_fastpath(buf, pkt_len);                              //判断是否为ping包，是的话置is_ping为1
 #else
             int is_ping = 0;
 #endif
 
             /* ====== 解除单包 640B 限制：>640 直接单包直发 ====== */
-            if (pkt_len > AMP_BATCH_MAX_BYTES) {
-                (void)amp_flush_batch_if_any(&batch);
-                (void)amp_send_msg(dst_ip, buf, pkt_len);
+            if (pkt_len > AMP_BATCH_MAX_BYTES) {                                            //如果当前包超过640B
+                (void)amp_flush_batch_if_any(&batch);                                       //则先将之前存的batch发出
+                (void)amp_send_msg(dst_ip, buf, pkt_len);                                   //再单独将本批次的IP包写入
                 continue;
             }
 
             /* 对于 <=640 的包，仍要考虑批帧头/长度字段的开销：塞不进批帧就单包直发 */
-            size_t agg_overhead = sizeof(amp_batch_hdr_t) + 2; /* 若批帧为空，只装一个子包的最小开销 */
-            if (pkt_len + agg_overhead > AMP_BATCH_MAX_BYTES) {
-                (void)amp_flush_batch_if_any(&batch);
-                (void)amp_send_msg(dst_ip, buf, pkt_len);
+            size_t agg_overhead = sizeof(amp_batch_hdr_t) + 2;                              /* 若批帧为空，只装一个子包的最小开销（包长+2） */
+            if (pkt_len + agg_overhead > AMP_BATCH_MAX_BYTES) {                             //如果当前IP包长度加上另一最小帧大于640依旧
+                (void)amp_flush_batch_if_any(&batch);                                       //则先将之前存的batch发出
+                (void)amp_send_msg(dst_ip, buf, pkt_len);                                   //再单独将本批次的IP包写入
                 continue;
             }
 
             /* ping 快速通道：不等待聚合窗口。
              * 优先尝试把 ping 塞进当前批次，然后立刻 flush（尽量不额外增加 SGI 次数）。 */
-            if (is_ping) {
-                int appended = 0;
-                if (batch.count == 0 || batch.dst_ip == dst_ip) {
-                    if (batch_append(&batch, buf, pkt_len, dst_ip) == 0)
-                        appended = 1;
+            if (is_ping) {                                                                  //如果当前IP包时ping包
+                int appended = 0;                                                           //定义添加标识
+                if (batch.count == 0 || batch.dst_ip == dst_ip) {                           //如果当前序列为空或者batch的目的IP与ping包一致
+                    if (batch_append(&batch, buf, pkt_len, dst_ip) == 0)                    //如果添加成功
+                        appended = 1;                                                       //添加标识置为1
                 }
-                if (!appended) {
-                    (void)amp_flush_batch_if_any(&batch);
-                    (void)amp_send_msg(dst_ip, buf, pkt_len);
+                if (!appended) {                                                            //如果添加标识还是0代表上一个if中添加ping包失败
+                    (void)amp_flush_batch_if_any(&batch);                                   //那就先将存的batch发出
+                    (void)amp_send_msg(dst_ip, buf, pkt_len);                               //再单独发出ping包
                 } else {
-                    (void)amp_flush_batch_if_any(&batch);
+                    (void)amp_flush_batch_if_any(&batch);                                   //如果前面添加成功，则直接发出整个batch
                 }
                 continue;
             }
 
             /* 普通小包：按目的IP聚合。
+			
              * 若目的IP改变，先 flush 再开始新批次。 */
-            if (batch.count > 0 && batch.dst_ip != dst_ip)
-                (void)amp_flush_batch_if_any(&batch);
-
-            int rc = batch_append(&batch, buf, pkt_len, dst_ip);
+            if (batch.count > 0 && batch.dst_ip != dst_ip)                                  //当前IP包目的IP如果与存的batch不同
+                (void)amp_flush_batch_if_any(&batch);                                       //则先发出存的batch
+                                                                                            //否则如果这是batch的第一发或者目的IP一致则
+            int rc = batch_append(&batch, buf, pkt_len, dst_ip);                            //定义rc为添加IP包进入batch函数的返回值
             if (rc == -2) {
                 /* 空间不足：先 flush 再试一次；若还是不行就单包直发 */
                 (void)amp_flush_batch_if_any(&batch);
-                rc = batch_append(&batch, buf, pkt_len, dst_ip);
+                rc = batch_append(&batch, buf, pkt_len, dst_ip);                            //再次添加
                 if (rc != 0)
                     (void)amp_send_msg(dst_ip, buf, pkt_len);
             } else if (rc != 0) {
@@ -479,6 +500,7 @@ static int tun_write_packet(int fd, const uint8_t *pkt, size_t len)
     }
 }
 
+/* 线程2：从驱动read()取出对端发来的IP包，写回TUN，让内核继续路由到eth1发给本地PC */
 static void *amp_to_tun_thread(void *arg)
 {
     (void)arg;
@@ -495,6 +517,7 @@ static void *amp_to_tun_thread(void *arg)
             continue;
         if (msg.len == 0 || msg.len > MAX_PAYLOAD_SIZE)
             continue;
+        /* 目前约定：驱动RX回来的都是数据类（data_type==0），控制数据仍走CPU0->CPU1方向即可 */
 
         /* 兼容：
          * - AMPB：拆包写回 TUN
@@ -524,6 +547,9 @@ static void *amp_to_tun_thread(void *arg)
     return NULL;
 }
 
+/*
+控制数据发送函数
+ */
 static int process_control_frame(uint8_t *udp_payload, int payload_len)
 {
     if (payload_len != (int)sizeof(control_frame_t))
@@ -582,6 +608,7 @@ static void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_c
     (void)process_control_frame((uint8_t *)payload, payload_len);
 }
 
+/* 控制帧仍然用你原来的pcap方式截获（不影响路由数据面） */
 static void *pcap_control_thread(void *arg)
 {
     (void)arg;
